@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>Jukebox Remote</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .times { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+  .vol { display: flex; gap: 10px; align-items: center; margin-top: 14px; }
+  .vol span { width: 34px; text-align: right; font-size: 14px; color: var(--muted); flex: none; }
+  form.add { display: flex; gap: 8px; }
+  form.add button { flex: none; }
+  #results:not(:empty) { margin-top: 10px; }
+  .name-row { display: flex; gap: 8px; align-items: center; }
+  .name-row label { flex: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Party Jukebox</h1>
+    <span class="small muted" id="playerStatus"><span class="dot"></span>Connecting…</span>
+  </header>
+
+  <div id="err" class="error" hidden></div>
+
+  <section class="panel">
+    <h2>Now playing</h2>
+    <div id="now"></div>
+    <div id="progress" hidden>
+      <div class="bar"><div id="barFill"></div></div>
+      <div class="times"><span id="tPos">0:00</span><span id="tDur">0:00</span></div>
+    </div>
+    <div class="controls">
+      <button id="playBtn" aria-label="Play or pause">⏯</button>
+      <button id="skipBtn" aria-label="Skip">⏭ Skip</button>
+    </div>
+    <div class="vol">
+      <span aria-hidden="true">🔈</span>
+      <input type="range" id="vol" min="0" max="100" step="1" aria-label="Volume">
+      <span id="volLabel"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Add a song</h2>
+    <form class="add" id="addForm">
+      <input type="search" id="q" class="grow" autocomplete="off" enterkeyhint="search"
+             placeholder="Search or paste a YouTube link">
+      <button class="primary" type="submit" id="addBtn">Go</button>
+    </form>
+    <div id="results"></div>
+  </section>
+
+  <section class="panel">
+    <div class="row" style="margin-bottom: 10px;">
+      <h2 class="grow" style="margin: 0;">Up next <span id="count"></span></h2>
+      <button class="ghost small" id="clearBtn" hidden>Clear</button>
+    </div>
+    <div id="queue"></div>
+  </section>
+
+  <section class="panel name-row">
+    <label for="name" class="small muted">Your name</label>
+    <input type="text" id="name" maxlength="40" placeholder="Shown on songs you add">
+  </section>
+</div>
+
+<script src="/common.js"></script>
+<script>
+const POLL_MS = 3000;
+const $ = (id) => document.getElementById(id);
+
+let state = null;
+let status = null;
+let searchEnabled = false;
+let clockSkew = 0;  // server time minus local time
+let pollTimer = null;
+
+$('name').value = store.get('jukebox-name');
+$('name').addEventListener('change', () => store.set('jukebox-name', $('name').value.trim()));
+
+function update(data) {
+  if (data.now) clockSkew = data.now - Date.now();
+  if (data.searchEnabled !== undefined) searchEnabled = data.searchEnabled;
+  status = data.status ?? null;
+  // Ignore a poll that finished after a newer command response.
+  if (!state || (data.state.rev ?? 0) >= (state.rev ?? 0)) state = data.state;
+  render();
+}
+
+async function poll() {
+  clearTimeout(pollTimer);
+  try {
+    update(await api('/api/state'));
+    showError(null);
+  } catch (err) {
+    showError(`Can't reach the jukebox: ${err.message}`);
+  }
+  if (document.visibilityState === 'visible') pollTimer = setTimeout(poll, POLL_MS);
+}
+
+// Phones can sleep the tab; refresh as soon as it comes back.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') poll();
+  else clearTimeout(pollTimer);
+});
+
+async function command(action, extra = {}) {
+  try {
+    update(await api('/api/command', { method: 'POST', body: { action, ...extra } }));
+    return true;
+  } catch (err) {
+    if (err instanceof PinError) {
+      if (askPin('Enter the jukebox PIN to control the music')) return command(action, extra);
+    } else {
+      toast(err.message);
+    }
+    return false;
+  }
+}
+
+$('playBtn').addEventListener('click', () => command(state?.playing ? 'pause' : 'play'));
+$('skipBtn').addEventListener('click', () => command('skip', { currentId: state?.current?.id }));
+$('clearBtn').addEventListener('click', () => {
+  if (confirm('Remove every song from the queue?')) command('clear');
+});
+
+$('vol').addEventListener('input', () => { $('volLabel').textContent = $('vol').value; });
+$('vol').addEventListener('change', () => command('volume', { value: Number($('vol').value) }));
+
+$('addForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const q = $('q').value.trim();
+  if (!q) return;
+  $('q').blur();
+  if (/youtu\.?be|youtube\.com/i.test(q)) {
+    $('addBtn').disabled = true;
+    if (await command('add', { url: q, by: store.get('jukebox-name') })) {
+      toast('Added to the queue');
+      $('q').value = '';
+      $('results').replaceChildren();
+    }
+    $('addBtn').disabled = false;
+    return;
+  }
+  if (!searchEnabled) {
+    toast("Search isn't set up. Paste a YouTube link instead.");
+    return;
+  }
+  await search(q);
+});
+
+async function search(q) {
+  $('addBtn').disabled = true;
+  $('results').replaceChildren(el('div', { class: 'muted small' }, 'Searching…'));
+  try {
+    const { results } = await api(`/api/search?q=${encodeURIComponent(q)}`);
+    $('results').replaceChildren(
+      ...(results.length ? results.map(resultRow) : [el('div', { class: 'muted small' }, 'No results.')]),
+    );
+  } catch (err) {
+    if (err instanceof PinError && askPin('Enter the jukebox PIN to search')) {
+      $('addBtn').disabled = false;
+      return search(q);
+    }
+    $('results').replaceChildren(el('div', { class: 'muted small' }, err.message));
+  }
+  $('addBtn').disabled = false;
+}
+
+function resultRow(r) {
+  const addBtn = el('button', {}, 'Add');
+  const nextBtn = el('button', { title: 'Play next' }, 'Next');
+  const add = async (next) => {
+    addBtn.disabled = nextBtn.disabled = true;
+    const ok = await command('add', { videoId: r.videoId, title: r.title, channel: r.channel, by: store.get('jukebox-name'), next });
+    if (ok) {
+      toast(next ? 'Playing next' : 'Added to the queue');
+      addBtn.textContent = 'Added ✓';
+      nextBtn.hidden = true;
+    } else {
+      addBtn.disabled = nextBtn.disabled = false;
+    }
+  };
+  addBtn.addEventListener('click', () => add(false));
+  nextBtn.addEventListener('click', () => add(true));
+  return el('div', { class: 'song' },
+    el('img', { src: thumb(r.videoId), alt: '', loading: 'lazy' }),
+    el('div', { class: 'grow' },
+      el('div', { class: 'title' }, r.title),
+      el('div', { class: 'meta' }, r.channel)),
+    nextBtn, addBtn);
+}
+
+function render() {
+  if (!state) return;
+  const cur = state.current;
+
+  $('playerStatus').replaceChildren(
+    el('span', { class: status ? 'dot on' : 'dot' }),
+    status ? 'Player connected' : 'Player offline',
+  );
+
+  $('now').replaceChildren(cur
+    ? el('div', { class: 'now' },
+        el('img', { src: thumb(cur.videoId), alt: '' }),
+        el('div', { class: 'grow' },
+          el('div', { class: 'title' }, cur.title),
+          el('div', { class: 'muted small' },
+            [cur.channel, cur.by && `added by ${cur.by}`].filter(Boolean).join(' · '))))
+    : el('div', { class: 'muted' }, 'Nothing playing. Add a song below.'));
+
+  $('playBtn').textContent = state.playing ? '⏸ Pause' : '▶ Play';
+  $('playBtn').disabled = !cur;
+  $('skipBtn').disabled = !cur;
+
+  if (document.activeElement !== $('vol')) {
+    $('vol').value = state.volume;
+    $('volLabel').textContent = state.volume;
+  }
+
+  $('count').textContent = state.queue.length ? `(${state.queue.length})` : '';
+  $('clearBtn').hidden = state.queue.length === 0;
+  $('queue').replaceChildren(
+    ...(state.queue.length
+      ? state.queue.map((q, i) => el('div', { class: 'song' },
+          el('img', { src: thumb(q.videoId), alt: '', loading: 'lazy' }),
+          el('div', { class: 'grow' },
+            el('div', { class: 'title' }, q.title),
+            el('div', { class: 'meta' }, q.by ? `added by ${q.by}` : q.channel)),
+          i > 0 ? el('button', { title: 'Play next', 'aria-label': 'Play next', onclick: () => command('bump', { id: q.id }) }, '⤒') : null,
+          el('button', { title: 'Remove', 'aria-label': 'Remove', onclick: () => command('remove', { id: q.id }) }, '✕')))
+      : [el('div', { class: 'muted small' }, 'The queue is empty.')]),
+  );
+
+  renderProgress();
+}
+
+function renderProgress() {
+  const cur = state?.current;
+  const live = cur && status && status.itemId === cur.id && status.duration > 0;
+  $('progress').hidden = !live;
+  if (!live) return;
+  const elapsed = status.playing ? (Date.now() + clockSkew - status.at) / 1000 : 0;
+  const pos = Math.min(status.duration, status.position + elapsed);
+  $('barFill').style.width = `${(pos / status.duration) * 100}%`;
+  $('tPos').textContent = fmtTime(pos);
+  $('tDur').textContent = fmtTime(status.duration);
+}
+setInterval(renderProgress, 1000);
+
+function showError(message) {
+  $('err').hidden = !message;
+  $('err').textContent = message || '';
+}
+
+poll();
+</script>
+</body>
+</html>

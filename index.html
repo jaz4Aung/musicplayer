@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Party Jukebox</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  .choice { display: block; text-decoration: none; color: inherit; }
+  .choice:hover .panel { border-color: var(--accent); }
+  .choice strong { display: block; font-size: 18px; margin-bottom: 4px; }
+</style>
+</head>
+<body>
+<div class="wrap" style="padding-top: 48px;">
+  <h1>Party Jukebox</h1>
+  <p class="muted">Play YouTube on one computer and control it from any phone.</p>
+  <a class="choice" href="/remote">
+    <div class="panel">
+      <strong>📱 Remote</strong>
+      <span class="muted">Add songs, skip, pause and change the volume.</span>
+    </div>
+  </a>
+  <a class="choice" href="/player">
+    <div class="panel">
+      <strong>🔊 Player</strong>
+      <span class="muted">Open this on the computer connected to the speakers.</span>
+    </div>
+  </a>
+</div>
+</body>
+</html>

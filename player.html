@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jukebox Player</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  body { min-height: 100vh; }
+  #start { min-height: 100vh; display: grid; place-items: center; text-align: center; padding: 16px; }
+  #start button { font-size: 20px; padding: 16px 28px; }
+  #stage { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 16px; min-height: 100vh; }
+  .video { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: var(--radius); overflow: hidden; }
+  .video iframe, .video #yt { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .idle { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; color: var(--muted); padding: 24px; }
+  .np-title { font-size: 26px; font-weight: 700; margin: 16px 0 4px; overflow-wrap: anywhere; }
+  .side { display: flex; flex-direction: column; gap: 14px; }
+  .side .panel { margin: 0; }
+  #qr { background: #fff; padding: 10px; border-radius: 10px; width: max-content; margin: 0 auto 10px; }
+  #qr img, #qr canvas { display: block; }
+  .remote-url { text-align: center; font-weight: 600; overflow-wrap: anywhere; }
+  @media (max-width: 900px) { #stage { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<div id="start">
+  <div>
+    <h1>Party Jukebox</h1>
+    <p class="muted">Keep this tab open on the computer connected to the speakers.</p>
+    <button class="primary" id="startBtn">Start the jukebox</button>
+  </div>
+</div>
+
+<div id="stage" hidden>
+  <main>
+    <div id="err" class="error" hidden></div>
+    <div class="video">
+      <div id="yt"></div>
+      <div class="idle" id="idle">
+        <div>
+          <div style="font-size: 22px; color: var(--text); margin-bottom: 6px;">Nothing playing</div>
+          Add a song from your phone.
+        </div>
+      </div>
+    </div>
+    <div class="np-title" id="npTitle"></div>
+    <div class="muted" id="npMeta"></div>
+  </main>
+
+  <aside class="side">
+    <div class="panel">
+      <h2>Control from your phone</h2>
+      <div id="qr"></div>
+      <div class="remote-url" id="remoteUrl"></div>
+    </div>
+    <div class="panel">
+      <h2>Up next <span id="count"></span></h2>
+      <div id="queue"></div>
+    </div>
+  </aside>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script src="/common.js"></script>
+<script>
+const POLL_MS = 3000;
+let yt = null;
+let loadedItemId = null;   // the queue item the YouTube player has loaded
+let erroredItemId = null;  // set when YouTube refuses to play that item
+let polling = false;
+let pollAgain = false;
+let pollTimer = null;
+let pinAsked = false;
+
+const $ = (id) => document.getElementById(id);
+
+$('startBtn').addEventListener('click', () => {
+  $('start').hidden = true;
+  $('stage').hidden = false;
+  showRemoteLink();
+  keepAwake();
+  const tag = document.createElement('script');
+  tag.src = 'https://www.youtube.com/iframe_api';
+  document.head.append(tag);
+});
+
+window.onYouTubeIframeAPIReady = () => {
+  yt = new YT.Player('yt', {
+    width: '100%',
+    height: '100%',
+    playerVars: { autoplay: 1, controls: 0, rel: 0, playsinline: 1, iv_load_policy: 3 },
+    events: {
+      onReady: () => poll(),
+      onStateChange: (e) => { if (e.data === YT.PlayerState.ENDED) poll(); },
+      // 2: bad ID, 5: HTML5 error, 100: removed, 101/150: embedding disabled
+      onError: () => { erroredItemId = loadedItemId; poll(); },
+    },
+  });
+};
+
+function showRemoteLink() {
+  const url = `${location.origin}/remote`;
+  $('remoteUrl').textContent = url.replace(/^https?:\/\//, '');
+  if (window.QRCode) {
+    new QRCode($('qr'), { text: url, width: 180, height: 180, correctLevel: QRCode.CorrectLevel.M });
+  } else {
+    $('qr').hidden = true;
+  }
+}
+
+async function keepAwake() {
+  try {
+    if (navigator.wakeLock) await navigator.wakeLock.request('screen');
+  } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') keepAwake();
+});
+
+async function poll() {
+  if (!yt || typeof yt.getPlayerState !== 'function') return;
+  if (polling) { pollAgain = true; return; }
+  polling = true;
+  clearTimeout(pollTimer);
+
+  const ps = yt.getPlayerState();
+  let event = null;
+  if (loadedItemId && erroredItemId === loadedItemId) event = { type: 'error', itemId: loadedItemId };
+  else if (loadedItemId && ps === YT.PlayerState.ENDED) event = { type: 'ended', itemId: loadedItemId };
+
+  try {
+    const data = await api('/api/player', {
+      method: 'POST',
+      body: {
+        event,
+        status: {
+          itemId: loadedItemId,
+          position: yt.getCurrentTime?.() || 0,
+          duration: yt.getDuration?.() || 0,
+          playing: ps === YT.PlayerState.PLAYING,
+        },
+      },
+    });
+    showError(null);
+    apply(data.state);
+  } catch (err) {
+    if (err instanceof PinError) {
+      if (!pinAsked) {
+        pinAsked = true;
+        askPin('This jukebox has a PIN. Enter it to start the player.');
+        pollAgain = true;
+      } else {
+        showError('Wrong PIN.', true);
+      }
+    } else {
+      showError(`Can't reach the server: ${err.message}`);
+    }
+  } finally {
+    polling = false;
+    if (pollAgain) { pollAgain = false; poll(); }
+    else pollTimer = setTimeout(poll, POLL_MS);
+  }
+}
+
+function apply(state) {
+  const cur = state.current;
+  if ((cur?.id || null) !== loadedItemId) {
+    loadedItemId = cur?.id || null;
+    erroredItemId = null;
+    if (cur) {
+      if (state.playing) yt.loadVideoById(cur.videoId);
+      else yt.cueVideoById(cur.videoId);
+    } else {
+      yt.stopVideo();
+    }
+  } else if (cur && erroredItemId !== loadedItemId) {
+    const ps = yt.getPlayerState();
+    const S = YT.PlayerState;
+    if (state.playing && (ps === S.PAUSED || ps === S.CUED || ps === S.UNSTARTED)) yt.playVideo();
+    else if (!state.playing && (ps === S.PLAYING || ps === S.BUFFERING)) yt.pauseVideo();
+  }
+  if (yt.getVolume() !== state.volume) yt.setVolume(state.volume);
+  render(state);
+}
+
+function render(state) {
+  const cur = state.current;
+  $('idle').hidden = Boolean(cur);
+  $('npTitle').textContent = cur ? cur.title : '';
+  $('npMeta').textContent = cur
+    ? [cur.channel, cur.by && `added by ${cur.by}`, !state.playing && 'Paused'].filter(Boolean).join(' · ')
+    : '';
+  $('count').textContent = state.queue.length ? `(${state.queue.length})` : '';
+  const shown = state.queue.slice(0, 8);
+  $('queue').replaceChildren(
+    ...(shown.length
+      ? shown.map((q) => el('div', { class: 'song' },
+          el('img', { src: thumb(q.videoId), alt: '', loading: 'lazy' }),
+          el('div', { class: 'grow' },
+            el('div', { class: 'title' }, q.title),
+            el('div', { class: 'meta' }, q.by ? `added by ${q.by}` : q.channel))))
+      : [el('div', { class: 'muted small' }, 'The queue is empty.')]),
+    state.queue.length > shown.length
+      ? el('div', { class: 'muted small', style: 'padding-top: 8px' }, `+ ${state.queue.length - shown.length} more`)
+      : null,
+  );
+}
+
+function showError(message, withPinButton) {
+  const box = $('err');
+  box.hidden = !message;
+  if (!message) return;
+  box.replaceChildren(message, withPinButton
+    ? el('button', { style: 'margin-left: 10px', onclick: () => { askPin(); poll(); } }, 'Enter PIN')
+    : '');
+}
+</script>
+</body>
+</html>
