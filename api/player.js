@@ -1,7 +1,7 @@
 import { advance, readState, updateState, writeStatus } from '../lib/store.js';
 import { body, clean, handle, pinOk, pinRequired, send } from '../lib/http.js';
 
-// The player page calls this every few seconds: it reports what it is
+// The player page calls this every few seconds (less often when idle): it reports what it is
 // doing and gets back what it should be doing.
 export default handle(async (req, res) => {
   if (req.method !== 'POST') return send(res, 405, { error: 'Use POST.' });
@@ -22,14 +22,19 @@ export default handle(async (req, res) => {
     state = await readState();
   }
 
-  const report = input.status || {};
-  await writeStatus({
-    itemId: clean(report.itemId, 64) || null,
-    position: Number(report.position) || 0,
-    duration: Number(report.duration) || 0,
-    playing: Boolean(report.playing),
-    at: Date.now(),
-  });
+  // The player leaves out its status when nothing changed, which saves a
+  // Redis write on most polls.
+  const report = input.status;
+  if (report) {
+    await writeStatus({
+      itemId: clean(report.itemId, 64) || null,
+      position: Number(report.position) || 0,
+      duration: Number(report.duration) || 0,
+      playing: Boolean(report.playing),
+      hibernating: Boolean(report.hibernating),
+      at: Date.now(),
+    });
+  }
 
   send(res, 200, { state, pinRequired: pinRequired(), now: Date.now() });
 });

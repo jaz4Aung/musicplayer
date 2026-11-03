@@ -14,9 +14,10 @@ function call(handler, { method = 'GET', body, query = {}, headers = {} } = {}) 
   return new Promise((resolve) => {
     const res = {
       statusCode: 200,
-      setHeader() {},
+      headers: {},
+      setHeader(name, value) { this.headers[name.toLowerCase()] = value; },
       status(code) { this.statusCode = code; return this; },
-      json(data) { resolve({ status: this.statusCode, data }); },
+      json(data) { resolve({ status: this.statusCode, data, headers: this.headers }); },
     };
     handler({ method, body, query, headers }, res);
   });
@@ -127,6 +128,26 @@ test('player status is visible to remotes', async () => {
   const r = await call(stateApi);
   assert.equal(r.data.status.position, 42);
   assert.equal(r.data.status.playing, true);
+});
+
+test('a player poll without status keeps the last status', async () => {
+  await player({ status: { itemId: 'x', position: 42, duration: 200, playing: true } });
+  await player({});
+  const r = await call(stateApi);
+  assert.equal(r.data.status.itemId, 'x');
+  assert.equal(r.data.status.position, 42);
+});
+
+test('hibernating status is passed on to remotes', async () => {
+  await player({ status: { itemId: null, playing: false, hibernating: true } });
+  const r = await call(stateApi);
+  assert.equal(r.data.status.hibernating, true);
+});
+
+test('state is cached briefly on the CDN but not in browsers', async () => {
+  const r = await call(stateApi);
+  assert.equal(r.headers['vercel-cdn-cache-control'], 'max-age=2');
+  assert.equal(r.headers['cache-control'], 'no-store');
 });
 
 test('concurrent adds are not lost', async () => {

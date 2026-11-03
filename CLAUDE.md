@@ -10,13 +10,13 @@ YouTube jukebox: one computer plays music (the **player**), guests control it fr
 
 | Path | What it does |
 |---|---|
-| `player.html` | Desktop page. "Start the jukebox" button, YouTube IFrame player (controls hidden), QR code to `/remote`, up-next list. Polls `/api/player` every 3s, reports position, gets state back. Skips videos that error (embedding disabled). |
+| `player.html` | Desktop page. "Start the jukebox" button, YouTube IFrame player (controls hidden), QR code to `/remote`, up-next list. Polls `/api/player` every 3s while playing, 15s when paused/empty, 30s after 10 min idle. Sends its status only when it changes (or every 60s as a heartbeat). Hibernate panel: "Hibernate now" button (also pauses) and optional nightly hours (saved in localStorage); while hibernating and not playing it polls every 5 min and the status TTL is 11 min. Phones show "Player hibernating". Skips videos that error (embedding disabled). |
 | `remote.html` | Phone page. Now playing + progress bar, play/pause, skip, volume, search or paste link, add / play next, queue (move to next, remove, clear), "your name". Polls `/api/state` every 3s, stops while the tab is hidden. |
 | `index.html` | Landing page linking to both. |
 | `common.js`, `style.css` | Shared helpers (`api()`, `el()` DOM builder, PIN prompt, toast) and dark theme. |
-| `api/state.js` | GET: state + player status + `pinRequired` + `searchEnabled`. No PIN needed. |
+| `api/state.js` | GET: state + player status + `pinRequired` + `searchEnabled`. No PIN needed. Cached 2s on Vercel's CDN (`Vercel-CDN-Cache-Control`) so phones share reads. |
 | `api/command.js` | POST actions: add, remove, bump, skip (ignores stale `currentId`), pause, play, volume, clear. Looks up titles for pasted links via YouTube oEmbed. |
-| `api/player.js` | POST from the player: `ended`/`error` events advance the queue (only if the item is current), status saved with 15s TTL ("player offline" after that). |
+| `api/player.js` | POST from the player: `ended`/`error` events advance the queue (only if the item is current), status saved with 120s TTL, only when the player sends one ("player offline" after that). |
 | `api/search.js` | YouTube Data API search (embeddable videos only), cached 1h. 501 if no key. |
 | `lib/store.js` | Redis access. State is one JSON key `jukebox:state` updated under a short lock key. Falls back to an in-memory store when there are no Redis env vars and not on Vercel. |
 | `lib/http.js` | PIN check (`x-jukebox-pin` header), link parsing, helpers. |
@@ -35,13 +35,15 @@ YouTube jukebox: one computer plays music (the **player**), guests control it fr
 - Plain HTML/JS, no framework, no build step. ES modules (`"type": "module"`).
 - Build page content with `el()` / `textContent`, never `innerHTML` (song titles come from users).
 - Run `npm test` before committing. Add tests for new API behavior.
-- Keep Upstash usage low: one read per remote poll, two commands per player poll.
+- Keep Upstash usage low (free tier ran out once because a player tab was left open): one read per remote poll (shared via CDN cache), usually one command per player poll, slow polling when idle.
 
 ## Progress log
 
 - 2026-10-06: Got the repo from whatcoffee-bakery/jukebox (only README/package.json/vercel.json). Pushed it to jaz4Aung/musicplayer, set git user.name to jaz4Aung.
 - 2026-10-06: Built the whole app (commit d34488d). 11 API tests pass. Pages checked with jsdom against the local server. Not yet checked: real YouTube playback and the visual look in a browser.
 - 2026-10-06: User connected Upstash Redis in Vercel. Gave steps to redeploy, add `JUKEBOX_PIN` and add `YOUTUBE_API_KEY` (not yet confirmed done or tested live).
+- 2026-11-02: Hit the Upstash free limit (idle player tab polling every 3s, about 57K commands/day). Added idle polling, status-on-change and CDN caching of `/api/state`. 13 tests pass. Not yet checked in a real browser.
+- 2026-11-02: Added Hibernate button and nightly hibernate hours on the player. Not yet checked in a real browser.
 
 ## Next steps / ideas
 

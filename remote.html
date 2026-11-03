@@ -34,6 +34,7 @@
       <div class="bar"><div id="barFill"></div></div>
       <div class="times"><span id="tPos">0:00</span><span id="tDur">0:00</span></div>
     </div>
+    <div id="starting" class="small muted" hidden></div>
     <div class="controls">
       <button id="playBtn" aria-label="Play or pause">⏯</button>
       <button id="skipBtn" aria-label="Skip">⏭ Skip</button>
@@ -202,7 +203,7 @@ function render() {
 
   $('playerStatus').replaceChildren(
     el('span', { class: status ? 'dot on' : 'dot' }),
-    status ? 'Player connected' : 'Player offline',
+    !status ? 'Player offline' : status.hibernating ? 'Player hibernating' : 'Player connected',
   );
 
   $('now').replaceChildren(cur
@@ -244,6 +245,12 @@ function renderProgress() {
   const cur = state?.current;
   const live = cur && status && status.itemId === cur.id && status.duration > 0;
   $('progress').hidden = !live;
+  // An idle player only checks in every 15s to 5 minutes, so a new song or
+  // a press of play can take a moment to reach it.
+  $('starting').hidden = !status?.hibernating && !(cur && status && status.itemId !== cur.id);
+  $('starting').textContent = status?.hibernating
+    ? 'The player is hibernating. Songs start within 5 minutes.'
+    : 'Starting on the player…';
   if (!live) return;
   const elapsed = status.playing ? (Date.now() + clockSkew - status.at) / 1000 : 0;
   const pos = Math.min(status.duration, status.position + elapsed);

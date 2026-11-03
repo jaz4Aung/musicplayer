@@ -18,6 +18,8 @@
   .side .panel { margin: 0; }
   #qr { background: #fff; padding: 10px; border-radius: 10px; width: max-content; margin: 0 auto 10px; }
   #qr img, #qr canvas { display: block; }
+  .hib-times { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; }
+  .hib-times input[type=time] { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 4px 6px; }
   .remote-url { text-align: center; font-weight: 600; overflow-wrap: anywhere; }
   @media (max-width: 900px) { #stage { grid-template-columns: 1fr; } }
 </style>
@@ -55,6 +57,17 @@
       <div class="remote-url" id="remoteUrl"></div>
     </div>
     <div class="panel">
+      <h2>Hibernate</h2>
+      <p class="muted small" style="margin-top: 0;">When nothing is playing, check for new songs only every 5 minutes. Saves server usage when the tab stays open.</p>
+      <button id="hibBtn">Hibernate now</button>
+      <div class="hib-times small">
+        <label><input type="checkbox" id="hibAuto"> Every night from</label>
+        <input type="time" id="hibFrom" value="01:00" aria-label="Hibernate from">
+        <span>to</span>
+        <input type="time" id="hibTo" value="10:00" aria-label="Hibernate until">
+      </div>
+    </div>
+    <div class="panel">
       <h2>Up next <span id="count"></span></h2>
       <div id="queue"></div>
     </div>
@@ -64,7 +77,14 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="/common.js"></script>
 <script>
-const POLL_MS = 3000;
+// Every poll costs Redis commands, so the player slows down when there is
+// nothing to play. A newly added song can then take up to 30s to start.
+const POLL_MS = 3000;              // a song is playing
+const IDLE_POLL_MS = 15000;        // paused or queue empty
+const SLEEP_POLL_MS = 30000;       // idle for a while
+const SLEEP_AFTER_MS = 10 * 60 * 1000;
+const HEARTBEAT_MS = 60000;        // re-send an unchanged status this often
+const HIBERNATE_POLL_MS = 5 * 60 * 1000;
 let yt = null;
 let loadedItemId = null;   // the queue item the YouTube player has loaded
 let erroredItemId = null;  // set when YouTube refuses to play that item
@@ -72,6 +92,14 @@ let polling = false;
 let pollAgain = false;
 let pollTimer = null;
 let pinAsked = false;
+let idleSince = null;
+let lastSent = null;       // the last status the server accepted
+let delay = POLL_MS;
+let lastState = null;
+// Hibernate button choice ('on' / 'off'). It lasts until the nightly
+// schedule next starts or ends, then the schedule takes over again.
+let hibOverride = null;
+let lastScheduled = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -92,7 +120,11 @@ window.onYouTubeIframeAPIReady = () => {
     playerVars: { autoplay: 1, controls: 0, rel: 0, playsinline: 1, iv_load_policy: 3 },
     events: {
       onReady: () => poll(),
-      onStateChange: (e) => { if (e.data === YT.PlayerState.ENDED) poll(); },
+      // Report play/pause right away so the phones' progress bars stay right.
+      onStateChange: (e) => {
+        const S = YT.PlayerState;
+        if (e.data === S.ENDED || e.data === S.PLAYING || e.data === S.PAUSED) poll();
+      },
       // 2: bad ID, 5: HTML5 error, 100: removed, 101/150: embedding disabled
       onError: () => { erroredItemId = loadedItemId; poll(); },
     },
@@ -129,21 +161,28 @@ async function poll() {
   if (loadedItemId && erroredItemId === loadedItemId) event = { type: 'error', itemId: loadedItemId };
   else if (loadedItemId && ps === YT.PlayerState.ENDED) event = { type: 'ended', itemId: loadedItemId };
 
+  const status = {
+    itemId: loadedItemId,
+    position: yt.getCurrentTime?.() || 0,
+    duration: yt.getDuration?.() || 0,
+    playing: ps === YT.PlayerState.PLAYING,
+    hibernating: hibernating() && !(lastState?.current && lastState.playing),
+  };
+  const sendStatus = statusChanged(status);
+
   try {
     const data = await api('/api/player', {
       method: 'POST',
-      body: {
-        event,
-        status: {
-          itemId: loadedItemId,
-          position: yt.getCurrentTime?.() || 0,
-          duration: yt.getDuration?.() || 0,
-          playing: ps === YT.PlayerState.PLAYING,
-        },
-      },
+      body: { event, status: sendStatus ? status : undefined },
     });
+    if (sendStatus) lastSent = { ...status, at: Date.now() };
     showError(null);
+    lastState = data.state;
     apply(data.state);
+    delay = nextDelay(data.state);
+    // Going to sleep: tell the remotes now, or the short status TTL runs out
+    // before the next poll and they show "player offline".
+    if (delay === HIBERNATE_POLL_MS && !lastSent?.hibernating) pollAgain = true;
   } catch (err) {
     if (err instanceof PinError) {
       if (!pinAsked) {
@@ -157,10 +196,33 @@ async function poll() {
       showError(`Can't reach the server: ${err.message}`);
     }
   } finally {
+    renderHibernate();
     polling = false;
     if (pollAgain) { pollAgain = false; poll(); }
-    else pollTimer = setTimeout(poll, POLL_MS);
+    else pollTimer = setTimeout(poll, delay);
   }
+}
+
+// Remotes extrapolate the position from the last status, so only send a new
+// one when that guess would be off, plus a heartbeat to show we're online.
+function statusChanged(s) {
+  const last = lastSent;
+  if (!last || Date.now() - last.at > HEARTBEAT_MS) return true;
+  if (last.itemId !== s.itemId || last.playing !== s.playing) return true;
+  if (last.hibernating !== s.hibernating) return true;
+  if (Math.abs(last.duration - s.duration) > 1) return true;
+  const expected = last.position + (last.playing ? (Date.now() - last.at) / 1000 : 0);
+  return Math.abs(expected - s.position) > 2;
+}
+
+function nextDelay(state) {
+  if (state.current && state.playing) {
+    idleSince = null;
+    return POLL_MS;
+  }
+  if (hibernating()) return HIBERNATE_POLL_MS;
+  idleSince ??= Date.now();
+  return Date.now() - idleSince > SLEEP_AFTER_MS ? SLEEP_POLL_MS : IDLE_POLL_MS;
 }
 
 function apply(state) {
@@ -183,6 +245,54 @@ function apply(state) {
   if (yt.getVolume() !== state.volume) yt.setVolume(state.volume);
   render(state);
 }
+
+// Saved per computer, so the schedule survives a page reload.
+for (const id of ['hibFrom', 'hibTo']) {
+  if (store.get(`jukebox-${id}`)) $(id).value = store.get(`jukebox-${id}`);
+  $(id).addEventListener('change', () => { store.set(`jukebox-${id}`, $(id).value); hibChanged(); });
+}
+$('hibAuto').checked = store.get('jukebox-hibAuto') === '1';
+$('hibAuto').addEventListener('change', () => { store.set('jukebox-hibAuto', $('hibAuto').checked ? '1' : ''); hibChanged(); });
+
+$('hibBtn').addEventListener('click', async () => {
+  const sleep = !hibernating();
+  hibOverride = sleep ? 'on' : 'off';
+  if (sleep && lastState?.playing) {
+    try { await api('/api/command', { method: 'POST', body: { action: 'pause' } }); } catch {}
+  }
+  hibChanged();
+});
+
+function hibChanged() {
+  renderHibernate();
+  poll();
+}
+
+function inQuietHours() {
+  const from = $('hibFrom').value;
+  const to = $('hibTo').value;
+  if (!$('hibAuto').checked || !from || !to || from === to) return false;
+  const d = new Date();
+  const now = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return from < to ? now >= from && now < to : now >= from || now < to;
+}
+
+function hibernating() {
+  const scheduled = inQuietHours();
+  if (scheduled !== lastScheduled) {
+    if (lastScheduled !== null) hibOverride = null;
+    lastScheduled = scheduled;
+  }
+  return hibOverride ? hibOverride === 'on' : scheduled;
+}
+
+function renderHibernate() {
+  const on = hibernating();
+  $('hibBtn').textContent = on ? 'Wake up' : 'Hibernate now';
+  $('hibBtn').classList.toggle('primary', on);
+}
+renderHibernate();
+setInterval(renderHibernate, 30000);
 
 function render(state) {
   const cur = state.current;
